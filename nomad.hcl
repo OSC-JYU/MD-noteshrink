@@ -1,7 +1,7 @@
 job "md-noteshrink" {
   type = "service"
 
-  group "MD-bertopic" {
+  group "MD-noteshrink" {
     count = 1
 
     restart {
