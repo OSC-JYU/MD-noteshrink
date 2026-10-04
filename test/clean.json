@@ -1,0 +1,6 @@
+{
+    "task": {
+        "id": "clean",
+        "params": {"num_colors": 8}
+    }
+}

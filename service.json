@@ -1,0 +1,62 @@
+{
+    "id": "md-noteshrink",
+    "name": "Noteshrink",
+    "adapter": "elg",
+    "category": "preparation",
+    "status": "experimental",
+    "local_url": "http://localhost:9023",
+    "source_url": "https://github.com/mzucker/noteshrink",
+    "description": "Cleans up scans and photos of notes and documents by reducing them to a few colours: removes paper texture, bleed-through and noise, and makes the files much smaller.",
+    "supported_types": [
+        "image"
+    ],
+    "supported_formats": [
+        "png",
+        "jpg",
+        "jpeg"
+    ],
+    "tasks": {
+        "clean": {
+            "name": "Clean up scan",
+            "description": "Reduces the image to a few colours: a uniform background and the colours of the writing. Writes a PNG image.",
+            "info": "I tried to clean up scanned image. ",
+            "behaviour": "one-to-one",
+            "params": {
+                "num_colors": 8,
+                "value_threshold": 25,
+                "sat_threshold": 20,
+                "white_bg": false,
+                "saturate": true
+            },
+            "params_help": {
+                "num_colors": {
+                    "name": "Number of colours",
+                    "help": "Colours in the result, background included (2-64). Use 2 for black-and-white text; more for coloured pens or stamps.",
+                    "default": "8"
+                },
+                "value_threshold": {
+                    "name": "Background brightness threshold (%)",
+                    "help": "How much darker than the paper a pixel must be to count as writing. Raise it when paper texture or shadows remain; lower it when faint writing disappears.",
+                    "default": "25"
+                },
+                "sat_threshold": {
+                    "name": "Background colour threshold (%)",
+                    "help": "How much more colourful than the paper a pixel must be to count as writing. Raise it when coloured paper shows through.",
+                    "default": "20"
+                },
+                "white_bg": {
+                    "name": "White background",
+                    "display": "checkbox",
+                    "help": "Make the background pure white instead of the paper's colour.",
+                    "default": false
+                },
+                "saturate": {
+                    "name": "Strengthen colours",
+                    "display": "checkbox",
+                    "help": "Stretch the colours of the writing to full contrast.",
+                    "default": true
+                }
+            }
+        }
+    }
+}

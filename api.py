@@ -1,163 +1,147 @@
+"""MessyDesk API for noteshrink (https://github.com/mzucker/noteshrink): cleans up scans of
+notes by reducing them to a few colours, which removes paper texture, bleed-through and noise.
+
+POST /process takes a `message` (task `clean`) and, in HTTP mode, the image as `content`; in disk
+mode the image is read from message.file.path (see md_storage.py). /config, /help and /health come
+from md_service.py.
+"""
+import json
 import os
 import uuid
-from flask import Flask, request, jsonify, send_file
-from argparse import ArgumentParser
-from noteshrink import notescan_main
+from argparse import Namespace
+from typing import Optional
 
-# This adds the MessyDeskAPI endpoint to noteshrink
-# https://github.com/mzucker/noteshrink
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
+
+import md_service
+import md_storage
+import noteshrink
+
+app = FastAPI(title="MD-noteshrink", description="noteshrink for MessyDesk")
+
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "output"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# name: (default, low, high); percentages as in noteshrink's command line
+NUMBER_PARAMS = {
+    "num_colors": (8, 2, 64),
+    "value_threshold": (25, 0, 100),
+    "sat_threshold": (20, 0, 100),
+    "sample_fraction": (5, 1, 100),
+}
+BOOL_PARAMS = {"white_bg": False, "saturate": True}
 
 
-app = Flask(__name__)
+def options_from(params: dict) -> Namespace:
+    """noteshrink's options from the task params (percentages become fractions)."""
+    values = {}
+    for name, (default, low, high) in NUMBER_PARAMS.items():
+        raw = params.get(name, default)
+        try:
+            value = float(raw if raw not in (None, "") else default)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
+        if not low <= value <= high:
+            raise HTTPException(status_code=400, detail=f"{name} must be between {low} and {high}")
+        values[name] = value
+    flags = {}
+    for name, default in BOOL_PARAMS.items():
+        raw = params.get(name, default)
+        flags[name] = raw if isinstance(raw, bool) else str(raw).strip().lower() in ("1", "true", "yes", "on")
+    return Namespace(
+        num_colors=int(values["num_colors"]),
+        value_threshold=values["value_threshold"] / 100,
+        sat_threshold=values["sat_threshold"] / 100,
+        sample_fraction=values["sample_fraction"] / 100,
+        white_bg=flags["white_bg"],
+        saturate=flags["saturate"],
+        quiet=True,
+    )
 
-UPLOAD_FOLDER = 'uploads'
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
 
-OUTPUT_FOLDER = 'output'
-if not os.path.exists(OUTPUT_FOLDER):
-    os.makedirs(OUTPUT_FOLDER)
+def clean(image_path: str, output_path: str, options: Namespace) -> None:
+    """One image through noteshrink: background colour, palette of the foreground, indexed PNG."""
+    img, dpi = noteshrink.load(image_path)
+    if img is None:
+        raise HTTPException(status_code=400, detail="The input is not an image noteshrink can read")
+    samples = noteshrink.sample_pixels(img, options)
+    palette = noteshrink.get_palette(samples, options)
+    labels = noteshrink.apply_palette(img, palette, options)
+    noteshrink.save(output_path, labels, palette, dpi, options)
 
 
-@app.route('/process', methods=['POST'])
-def process_files():
-    # Check if files are present in the request
-    if 'request' not in request.files or 'content' not in request.files:
-        return jsonify({'error': 'JSON file and image file are required'}), 400
-    
-    json_file = request.files['request']
-    image_file = request.files['content']
+@app.get("/")
+def root():
+    return {"message": "noteshrink API for MessyDesk"}
 
-    # Check if the file is empty
-    if json_file.filename == '' or image_file.filename == '':
-        return jsonify({'error': 'Empty file submitted'}), 400
 
-    # Read JSON file
+@app.post("/process")
+async def process(message: UploadFile = File(...), content: Optional[UploadFile] = File(None)):
     try:
-        json_data = json_file.read().decode('utf-8')
-        # You can parse JSON data here if needed
-    except Exception as e:
-        return jsonify({'error': 'Failed to read JSON file: {}'.format(str(e))}), 400
+        msg = json.loads((await message.read()).decode("utf-8"))
+        if isinstance(msg, str):
+            msg = json.loads(msg)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid message: {e}")
+    task_id = (msg.get("task") or {}).get("id")
+    if task_id != "clean":
+        raise HTTPException(status_code=400, detail=f"Unsupported task: {task_id}")
+    options = options_from((msg.get("task") or {}).get("params") or {})
 
-    # Save image file with original extension
+    output_id = uuid.uuid4().hex
+    output_path = os.path.join(OUTPUT_FOLDER, f"{output_id}.png")
+    upload_path = None
     try:
-        output_id = str(uuid.uuid4())
-        image_filename, image_extension = os.path.splitext(image_file.filename)
-        image_path = os.path.join(UPLOAD_FOLDER, output_id + image_extension)
-        image_file.save(image_path)
-        filenames = [image_path]
-        args = get_argument_parser(os.path.join(OUTPUT_FOLDER, output_id)).parse_args(['dummy_script.py'] + filenames)
-
-        # call noteshrink
-        notescan_main(args)
-
-
+        if content is not None:
+            upload_path = os.path.join(UPLOAD_FOLDER, output_id + os.path.splitext(content.filename or "")[1])
+            with open(upload_path, "wb") as f:
+                f.write(await content.read())
+            image_path = upload_path
+        else:
+            image_path = str(md_storage.message_input_path(msg))
+        # numpy and k-means are CPU-bound - keep them off the event loop
+        await run_in_threadpool(clean, image_path, output_path, options)
+    except md_storage.StorageError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': 'Failed to save image file: {}'.format(str(e))}), 500
+        raise HTTPException(status_code=500, detail=f"Cleaning failed: {e}")
+    finally:
+        if upload_path:
+            try:
+                os.remove(upload_path)
+            except OSError:
+                pass
 
-    return jsonify({'response':{'type': 'stored', 'uri': ['/files/' + output_id + '.png']}}), 200
+    # <source label>.png, an image, as the elg adapter names a single HTTP output
+    if content is None:
+        entry = md_storage.stage_output(msg, output_path, f"{md_storage.source_label(msg)}.png", "image", "png")
+        return md_storage.disk_response([entry])
+    return {"response": {"type": "stored", "uri": f"/files/{output_id}.png"}}
 
 
-# endpoint to serve files
-@app.route('/files/<path:filename>', methods=['GET'])       
-def serve_file(filename):
-    file_path = os.path.join(OUTPUT_FOLDER, filename)
-    if os.path.isfile(file_path):
-        return send_file(file_path)
-    else:
-        return jsonify({'error': 'File not found'}), 404
+@app.get("/files/{filename}")
+def serve_file(filename: str, background_tasks: BackgroundTasks):
+    output_dir = os.path.realpath(OUTPUT_FOLDER)
+    file_path = os.path.realpath(os.path.join(output_dir, filename))
+    # only files directly in OUTPUT_FOLDER; '../' paths could read any file
+    if os.path.dirname(file_path) != output_dir or not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    background_tasks.add_task(os.remove, file_path)
+    return FileResponse(file_path, media_type="image/png")
 
-def get_argument_parser(basename):
 
-    '''Parse the command-line arguments for this program.'''
+# /config (service.json with the adapter of the storage mode), /help (help/index.md), /health
+md_service.add_routes(app)
 
-    parser = ArgumentParser(
-        description='convert scanned, hand-written notes to PDF')
 
-    show_default = ' (default %(default)s)'
+if __name__ == "__main__":
+    import uvicorn
 
-    parser.add_argument('filenames', metavar='IMAGE', nargs='+',
-                        help='files to convert')
-
-    parser.add_argument('-q', dest='quiet', action='store_true',
-                        default=False,
-                        help='reduce program output')
-
-    parser.add_argument('-b', dest='basename', metavar='BASENAME',
-                        default=basename,
-                        help='output PNG filename base' + show_default)
-
-    parser.add_argument('-o', dest='pdfname', metavar='PDF',
-                        default='output.pdf',
-                        help='output PDF filename' + show_default)
-
-    parser.add_argument('-v', dest='value_threshold', metavar='PERCENT',
-                        type=percent, default='25',
-                        help='background value threshold %%'+show_default)
-
-    parser.add_argument('-s', dest='sat_threshold', metavar='PERCENT',
-                        type=percent, default='20',
-                        help='background saturation '
-                        'threshold %%'+show_default)
-
-    parser.add_argument('-n', dest='num_colors', type=int,
-                        default='8',
-                        help='number of output colors '+show_default)
-
-    parser.add_argument('-p', dest='sample_fraction',
-                        metavar='PERCENT',
-                        type=percent, default='5',
-                        help='%% of pixels to sample' + show_default)
-
-    parser.add_argument('-w', dest='white_bg', action='store_true',
-                        default=False, help='make background white')
-
-    parser.add_argument('-g', dest='global_palette',
-                        action='store_true', default=False,
-                        help='use one global palette for all pages')
-
-    parser.add_argument('-S', dest='saturate', action='store_false',
-                        default=True, help='do not saturate colors')
-
-    parser.add_argument('-K', dest='sort_numerically',
-                        action='store_false', default=True,
-                        help='keep filenames ordered as specified; '
-                        'use if you *really* want IMG_10.png to '
-                        'precede IMG_2.png')
-
-    parser.add_argument('-P', dest='postprocess_cmd', default=None,
-                        help='set postprocessing command (see -O, -C, -Q)')
-
-    parser.add_argument('-e', dest='postprocess_ext',
-                        default='_post.png',
-                        help='filename suffix/extension for '
-                        'postprocessing command')
-
-    parser.add_argument('-O', dest='postprocess_cmd',
-                        action='store_const',
-                        const='optipng -silent %i -out %o',
-                        help='same as -P "%(const)s"')
-
-    parser.add_argument('-C', dest='postprocess_cmd',
-                        action='store_const',
-                        const='pngcrush -q %i %o',
-                        help='same as -P "%(const)s"')
-
-    parser.add_argument('-Q', dest='postprocess_cmd',
-                        action='store_const',
-                        const='pngquant --ext %e %i',
-                        help='same as -P "%(const)s"')
-
-    parser.add_argument('-c', dest='pdf_cmd', metavar="COMMAND",
-                        default='convert %i %o',
-                        help='PDF command (default "%(default)s")')
-
-    return parser
-
-def percent(string):
-    '''Convert a string (i.e. 85) to a fraction (i.e. .85).'''
-    return float(string)/100.0
-
-if __name__ == '__main__':
-    app.run(debug=True)
-
+    print(f"storage mode: {md_storage.describe_mode()}")
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "9023")))
